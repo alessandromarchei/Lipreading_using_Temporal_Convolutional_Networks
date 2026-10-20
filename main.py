@@ -102,7 +102,7 @@ def extract_feats(model):
     :rtype: FloatTensor
     """
     model.eval()
-    preprocessing_func = get_preprocessing_pipelines()['test']
+    preprocessing_func = get_preprocessing_pipelines(args.modality)['test']
     data = preprocessing_func(np.load(args.mouth_patch_path)['data'])  # data: TxHxW
     return model(torch.FloatTensor(data)[None, None, :, :, :].cuda(), lengths=[data.shape[0]])
 
@@ -295,6 +295,8 @@ def main():
 
     # -- evaluate best-performing epoch on test partition
     best_fp = os.path.join(ckpt_saver.save_dir, ckpt_saver.best_fn)
+    if not os.path.isfile(best_fp):  # validation accuracy never beat 0, e.g. in a very short run
+        best_fp = os.path.join(ckpt_saver.save_dir, ckpt_saver.checkpoint_fn)
     _ = load_model(best_fp, model)
     acc_avg_test, loss_avg_test = evaluate(model, dset_loaders['test'], criterion)
     logger.info(f"Test time performance of best epoch: {acc_avg_test} (loss: {loss_avg_test})")

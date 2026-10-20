@@ -106,6 +106,10 @@ We call the original LRW directory that includes timestamps (.txt) as *`<ANNONAT
 
 You can pass the checkpoint path (`.pth` or `.pth.tar`) *`<CHECKPOINT-PATH>`* to the variable argument *`--model-path`*, and specify the *`--init-epoch`* to 1 to resume training.
 
+4. Train on LRS3 word-level clips (no LRW license needed).
+
+LRS3 pretrain word alignments are turned into LRW-style 1.16 s word clips, with a 500-word vocabulary, so the same `main.py` trains the visual model on them. The mouth ROI extraction, vocabulary, clip building and feature extraction are documented in [preprocessing/lrs3](./preprocessing/lrs3), and the config is [configs/lrs3_resnet18_mstcn.json](./configs/lrs3_resnet18_mstcn.json).
+
 
 ### How to test
 
