@@ -236,7 +236,16 @@ class MyDataset(object):
 
     def __getitem__(self, idx):
 
-        raw_data = self.load_data(self.list[idx][0])
+        # a clip that cannot be read (empty/corrupt .npz) is skipped: the next clip is returned instead
+        for _ in range(len(self)):
+            try:
+                raw_data = self.load_data(self.list[idx][0])
+                break
+            except Exception as e:  # noqa: BLE001
+                print(f"WARNING: skipping unreadable clip {self.list[idx][0]} ({type(e).__name__}: {e})", flush=True)
+                idx = (idx + 1) % len(self)
+        else:
+            raise RuntimeError(f"No readable clip in partition {self._data_partition}")
         # -- perform variable length on training set
         if ( self._data_partition == 'train' ) and self.is_var_length and not self.use_boundary:
             data = self._apply_variable_length_aug(self.list[idx][0], raw_data)
