@@ -51,9 +51,11 @@ atexit.register(_close_lmdb_envs)
 
 class MyDataset(object):
     def __init__(self, modality, data_partition, data_dir, label_fp, annonation_direc=None,
-        preprocessing_func=None, data_suffix='.npz', use_boundary=False, data_format='raw'):
+        preprocessing_func=None, data_suffix='.npz', use_boundary=False, data_format='raw',
+        exclude_fp=None):
         assert data_format in ('raw', 'lmdb'), f"Unknown data format: {data_format}"
         self._data_format = data_format
+        self._exclude_fp = exclude_fp
         assert os.path.isfile( label_fp ), \
             f"File path provided for the labels does not exist. Path iput: {label_fp}."
         self._data_partition = data_partition
@@ -95,6 +97,14 @@ class MyDataset(object):
             self._get_files_from_lmdb()
         else:
             self._get_files_for_partition()
+
+        # -- drop clips listed in the exclude file (one WORD/partition/CLIP per line, e.g. from tools/scan_lmdb.py)
+        if self._exclude_fp:
+            excluded = {line.strip() for line in read_txt_lines(self._exclude_fp) if line.strip()}
+            n_before = len(self._data_files)
+            self._data_files = [f for f in self._data_files
+                                if os.path.splitext('/'.join(f.split('/')[-3:]))[0] not in excluded]
+            print(f"Partition {self._data_partition}: excluded {n_before - len(self._data_files)} clips listed in {self._exclude_fp}")
 
 
         # -- from self._data_files to self.list

@@ -162,6 +162,33 @@ python tools/benchmark_dataloader.py --raw-data-dir <MOUTH-ROIS-DIRECTORY> \
                                      --workers 0 2 4 8 --drop-cache
 ```
 
+Find clips that cannot be loaded. A clip is bad if its record is empty (a 0-byte `.npz` was packed), unreadable, or not a uint8 `[T, H, W]` array of at least 88x88. Such a clip stops training with errors such as `EOFError: No data left in file`. The scan also lists the clips of the authors' list that are missing from the LMDB, and writes the bad clips to `--out`:
+
+```Shell
+python tools/scan_lmdb.py --lmdb-dir <LMDB-DIRECTORY> --out bad_clips.txt \
+                          --face-list preprocessing/lrw500_detected_face.csv --workers 4
+```
+
+Then either rebuild those `.npz` files and pack again, or train without them by adding `--exclude-list bad_clips.txt`. The option works with both `--data-format` values.
+
+6. Train on several GPUs (DDP).
+
+Launch the same command with `torchrun`, one process per GPU. Without `torchrun` the run is the original single-GPU one.
+
+```Shell
+torchrun --standalone --nproc_per_node=2 main.py --modality video \
+                                                 --config-path configs/lrw_resnet18_mstcn.json \
+                                                 --data-format lmdb --data-dir <LMDB-DIRECTORY> \
+                                                 --workers 2
+```
+
+- `--batch-size` stays the global batch: the default 32 becomes 16 per GPU on 2 GPUs. With the gradient averaging of DDP, each step is the same as batch 32 on one GPU.
+- BatchNorm layers are converted to `SyncBatchNorm`, so their statistics are computed over the global batch, as on one GPU. `--no-sync-bn` keeps per-GPU statistics: this is faster, but it is a different training setup.
+- Each GPU draws its own mixup factor and permutation over its 16 clips, where one GPU draws one factor over 32 clips. This is the only remaining difference from the single-GPU recipe.
+- Validation and test clips are split across the GPUs without repeats, and the counts are summed, so the accuracy is over every clip exactly once.
+- Only rank 0 writes logs and checkpoints. The batch log shows rank 0's running statistics. Checkpoints load on one GPU as before, and resuming with `--model-path ... --init-epoch 1` works under `torchrun` too.
+- `--workers` is per process. Kaggle has 4 CPUs, so `--workers 2` with 2 GPUs.
+
 
 ### How to test
 

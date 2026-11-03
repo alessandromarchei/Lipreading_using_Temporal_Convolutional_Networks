@@ -10,12 +10,16 @@ import os
 import time
 import random
 import argparse
+import datetime
+import logging
 import numpy as np
 from tqdm import tqdm
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 
 from lipreading.utils import get_save_folder
 from lipreading.utils import load_json, save2npz
@@ -41,6 +45,8 @@ def load_args(default_config=None):
     parser.add_argument('--data-format', default='raw', choices=['raw', 'lmdb'],
                         help="raw: --data-dir holds WORD/SPLIT/*.npz (+ --annonation-direc for the .txt). "
                              "lmdb: --data-dir holds train.lmdb, val.lmdb, test.lmdb from preprocessing/lrw_lmdb.py")
+    parser.add_argument('--exclude-list', default=None,
+                        help='txt file with clips to leave out, one WORD/partition/CLIP per line (see tools/scan_lmdb.py)')
     # -- model config
     parser.add_argument('--backbone-type', type=str, default='resnet', choices=['resnet', 'shufflenet'], help='Architecture used for backbone')
     parser.add_argument('--relu-type', type=str, default='relu', choices=['relu','prelu'], help='what relu to use' )
@@ -87,6 +93,10 @@ def load_args(default_config=None):
     parser.add_argument('--logging-dir', type=str, default='./train_logs', help = 'path to the directory in which to save the log file')
     # use boundaries
     parser.add_argument('--use-boundary', default=False, action='store_true', help='include hard border at the testing stage.')
+    # -- multi-GPU (DDP), enabled when launched with torchrun --nproc_per_node=N
+    parser.add_argument('--sync-bn', default=True, action=argparse.BooleanOptionalAction,
+                        help='DDP only: BatchNorm statistics over the global batch, as with one GPU (default on)')
+    parser.add_argument('--dist-backend', default='nccl', help='DDP only: torch.distributed backend')
 
     args = parser.parse_args()
     return args
@@ -118,7 +128,7 @@ def evaluate(model, dset_loader, criterion):
     running_corrects = 0.
 
     with torch.no_grad():
-        for batch_idx, data in enumerate(tqdm(dset_loader)):
+        for batch_idx, data in enumerate(tqdm(dset_loader, disable=args.rank != 0)):
             if args.use_boundary:
                 input, lengths, labels, boundaries = data
                 boundaries = boundaries.cuda()
@@ -132,7 +142,12 @@ def evaluate(model, dset_loader, criterion):
             loss = criterion(logits, labels.cuda())
             running_loss += loss.item() * input.size(0)
 
-    print(f"{len(dset_loader.dataset)} in total\tCR: {running_corrects/len(dset_loader.dataset)}")
+    if args.world_size > 1:  # each rank saw a disjoint shard of the partition: sum the counts
+        totals = torch.tensor([running_corrects, running_loss], dtype=torch.float64, device='cuda')
+        dist.all_reduce(totals)
+        running_corrects, running_loss = totals.tolist()
+    if args.rank == 0:
+        print(f"{len(dset_loader.dataset)} in total\tCR: {running_corrects/len(dset_loader.dataset)}")
     return running_corrects/len(dset_loader.dataset), running_loss/len(dset_loader.dataset)
 
 
@@ -186,7 +201,9 @@ def train(model, dset_loader, criterion, epoch, optimizer, logger):
         running_all += input.size(0)
         # -- log intermediate results
         if batch_idx % args.interval == 0 or (batch_idx == len(dset_loader)-1):
-            update_logger_batch( args, logger, dset_loader, batch_idx, running_loss, running_corrects, running_all, batch_time, data_time )
+            # with DDP the counts are rank 0's, scaled by the number of ranks (the ratios are unchanged)
+            w = args.world_size
+            update_logger_batch( args, logger, dset_loader, batch_idx, running_loss * w, running_corrects * w, running_all * w, batch_time, data_time )
 
     return model
 
@@ -234,16 +251,50 @@ def get_model_from_json():
     return model
 
 
+def setup_distributed():
+    """torchrun sets WORLD_SIZE, RANK and LOCAL_RANK. Without them this is the original single-GPU run."""
+    args.world_size = int(os.environ.get('WORLD_SIZE', 1))
+    args.rank = int(os.environ.get('RANK', 0))
+    args.local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    if args.world_size == 1:
+        return
+    assert args.batch_size % args.world_size == 0, \
+        f"--batch-size {args.batch_size} (global batch) must be divisible by the number of GPUs {args.world_size}"
+    assert not args.extract_feats, "--extract-feats runs on one GPU, launch it without torchrun"
+    # one GPU per process; the modulo only matters when testing more processes than GPUs (with --dist-backend gloo)
+    args.local_rank = args.local_rank % torch.cuda.device_count()
+    torch.cuda.set_device(args.local_rank)
+    dist.init_process_group(backend=args.dist_backend, timeout=datetime.timedelta(minutes=60))
+    # rank 0 keeps the original seed; the other ranks draw different augmentations
+    torch.manual_seed(1 + args.rank)
+    np.random.seed(1 + args.rank)
+    random.seed(1 + args.rank)
+
+
 def main():
 
-    # -- logging
-    save_path = get_save_folder( args)
-    print(f"Model and log being saved in: {save_path}")
-    logger = get_logger(args, save_path)
-    ckpt_saver = CheckpointSaver(save_path)
+    setup_distributed()
+    is_main = args.rank == 0
+
+    # -- logging (rank 0 only: one log folder, one set of checkpoints)
+    if is_main:
+        save_path = get_save_folder( args)
+        print(f"Model and log being saved in: {save_path}")
+        logger = get_logger(args, save_path)
+        ckpt_saver = CheckpointSaver(save_path)
+        if args.world_size > 1:
+            logger.info(f"DDP on {args.world_size} GPUs: global batch {args.batch_size}, "
+                        f"{args.batch_size // args.world_size} per GPU, sync BN {args.sync_bn}")
+    else:
+        logger = logging.getLogger("mylog-rank{}".format(args.rank))
+        logger.addHandler(logging.NullHandler())
+        logger.propagate = False
+        ckpt_saver = None
 
     # -- get model
     model = get_model_from_json()
+    if args.world_size > 1 and args.sync_bn:
+        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)  # before the optimizer is built on the parameters
     # -- get dataset iterators
     dset_loaders = get_data_loaders(args)
     # -- get loss function
@@ -260,7 +311,8 @@ def main():
         if args.init_epoch > 0:
             model, optimizer, epoch_idx, ckpt_dict = load_model(args.model_path, model, optimizer)
             args.init_epoch = epoch_idx
-            ckpt_saver.set_best_from_ckpt(ckpt_dict)
+            if is_main:
+                ckpt_saver.set_best_from_ckpt(ckpt_dict)
             logger.info(f'Model and states have been successfully loaded from {args.model_path}')
         # init from trained model
         else:
@@ -280,29 +332,44 @@ def main():
     if args.model_path and args.init_epoch > 0:
         scheduler.adjust_lr(optimizer, args.init_epoch-1)
 
+    # -- DDP wrapper for training; evaluation and checkpoints use the plain model (no collectives in its
+    # forward, and state_dict keys without 'module.', so checkpoints load on one GPU as before)
+    train_model = DistributedDataParallel(model, device_ids=[args.local_rank]) if args.world_size > 1 else model
+
     epoch = args.init_epoch
 
     while epoch < args.epochs:
-        model = train(model, dset_loaders['train'], criterion, epoch, optimizer, logger)
+        if args.world_size > 1:
+            dset_loaders['train'].sampler.set_epoch(epoch)  # a different shuffle every epoch
+        train(train_model, dset_loaders['train'], criterion, epoch, optimizer, logger)
         acc_avg_val, loss_avg_val = evaluate(model, dset_loaders['val'], criterion)
         logger.info(f"{'val'} Epoch:\t{epoch:2}\tLoss val: {loss_avg_val:.4f}\tAcc val:{acc_avg_val:.4f}, LR: {showLR(optimizer)}")
         # -- save checkpoint
-        save_dict = {
-            'epoch_idx': epoch + 1,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict()
-        }
-        ckpt_saver.save(save_dict, acc_avg_val)
+        if is_main:
+            save_dict = {
+                'epoch_idx': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict()
+            }
+            ckpt_saver.save(save_dict, acc_avg_val)
         scheduler.adjust_lr(optimizer, epoch)
         epoch += 1
 
     # -- evaluate best-performing epoch on test partition
-    best_fp = os.path.join(ckpt_saver.save_dir, ckpt_saver.best_fn)
-    if not os.path.isfile(best_fp):  # validation accuracy never beat 0, e.g. in a very short run
-        best_fp = os.path.join(ckpt_saver.save_dir, ckpt_saver.checkpoint_fn)
-    _ = load_model(best_fp, model)
+    best_fp = [None]
+    if is_main:
+        best_fp[0] = os.path.join(ckpt_saver.save_dir, ckpt_saver.best_fn)
+        if not os.path.isfile(best_fp[0]):  # validation accuracy never beat 0, e.g. in a very short run
+            best_fp[0] = os.path.join(ckpt_saver.save_dir, ckpt_saver.checkpoint_fn)
+    if args.world_size > 1:
+        dist.broadcast_object_list(best_fp)  # also waits until rank 0 has written the checkpoint
+    _ = load_model(best_fp[0], model)
     acc_avg_test, loss_avg_test = evaluate(model, dset_loaders['test'], criterion)
     logger.info(f"Test time performance of best epoch: {acc_avg_test} (loss: {loss_avg_test})")
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()

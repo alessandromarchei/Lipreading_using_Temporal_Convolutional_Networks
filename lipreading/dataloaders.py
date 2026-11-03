@@ -39,8 +39,27 @@ def get_preprocessing_pipelines(modality):
     return preprocessing
 
 
+class ShardSampler(torch.utils.data.Sampler):
+    """Evaluation sampler for DDP: rank r gets clips r, r+W, r+2W, ... Every clip is seen exactly once
+    (DistributedSampler would pad with repeated clips and bias the accuracy)."""
+
+    def __init__(self, dataset, rank, world_size):
+        self.indices = list(range(rank, len(dataset), world_size))
+
+    def __iter__(self):
+        return iter(self.indices)
+
+    def __len__(self):
+        return len(self.indices)
+
+
 def get_data_loaders(args):
     preprocessing = get_preprocessing_pipelines( args.modality)
+
+    # -- DDP: --batch-size is the global batch, split evenly over the processes
+    world_size = getattr(args, 'world_size', 1)
+    rank = getattr(args, 'rank', 0)
+    batch_size = args.batch_size // world_size
 
     # create dataset object for each partition
     partitions = ['test'] if args.test else ['train', 'val', 'test']
@@ -54,11 +73,18 @@ def get_data_loaders(args):
                 data_suffix='.npz',
                 use_boundary=args.use_boundary,
                 data_format=getattr(args, 'data_format', 'raw'),
+                exclude_fp=getattr(args, 'exclude_list', None),
                 ) for partition in partitions}
+    samplers = {x: None for x in partitions}
+    if world_size > 1:
+        for x in partitions:
+            samplers[x] = (torch.utils.data.distributed.DistributedSampler(dsets[x], num_replicas=world_size, rank=rank, shuffle=True)
+                           if x == 'train' else ShardSampler(dsets[x], rank, world_size))
     dset_loaders = {x: torch.utils.data.DataLoader(
                         dsets[x],
-                        batch_size=args.batch_size,
-                        shuffle=True,
+                        batch_size=batch_size,
+                        shuffle=samplers[x] is None,
+                        sampler=samplers[x],
                         collate_fn=pad_packed_collate,
                         pin_memory=True,
                         num_workers=args.workers,
