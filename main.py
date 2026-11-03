@@ -38,6 +38,9 @@ def load_args(default_config=None):
     parser.add_argument('--data-dir', default='./datasets/LRW_h96w96_mouth_crop_gray', help='Loaded data directory')
     parser.add_argument('--label-path', type=str, default='./labels/500WordsSortedList.txt', help='Path to txt file with labels')
     parser.add_argument('--annonation-direc', default=None, help='Loaded data directory')
+    parser.add_argument('--data-format', default='raw', choices=['raw', 'lmdb'],
+                        help="raw: --data-dir holds WORD/SPLIT/*.npz (+ --annonation-direc for the .txt). "
+                             "lmdb: --data-dir holds train.lmdb, val.lmdb, test.lmdb from preprocessing/lrw_lmdb.py")
     # -- model config
     parser.add_argument('--backbone-type', type=str, default='resnet', choices=['resnet', 'shufflenet'], help='Architecture used for backbone')
     parser.add_argument('--relu-type', type=str, default='relu', choices=['relu','prelu'], help='what relu to use' )

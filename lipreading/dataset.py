@@ -1,5 +1,8 @@
+import io
 import os
+import atexit
 import glob
+import json
 import torch
 import random
 import librosa
@@ -7,10 +10,50 @@ import numpy as np
 import sys
 from lipreading.utils import read_txt_lines
 
+LMDB_FORMAT = b'lrw-npz-v1'
+# Readahead on: a record is one contiguous ~170 KB npz, so kernel readahead serves it in a few reads instead of one
+# 4 KB page fault at a time. Measured with tools/benchmark_dataloader.py: 2x faster on a cold cache, same when warm.
+LMDB_READAHEAD = True
+
+# One read-only handle per LMDB file and per process. py-lmdb refuses to open the same file twice in one
+# process, and LMDB handles must not be used across fork(), so a forked DataLoader worker drops the handles
+# it inherited and opens its own on first use.
+_LMDB_ENVS = {}
+_LMDB_PID = os.getpid()
+
+
+def _get_lmdb_env(path):
+    global _LMDB_PID
+    if _LMDB_PID != os.getpid():  # forked worker (or spawn/forkserver: the dict is empty anyway)
+        for env in _LMDB_ENVS.values():
+            env.close()  # safe: readonly, lock=False, so there is no shared reader table to release
+        _LMDB_ENVS.clear()
+        _LMDB_PID = os.getpid()
+    env = _LMDB_ENVS.get(path)
+    if env is None:
+        import lmdb  # only needed for the lmdb backend
+        # lock=False: nothing writes while training, and it works on read-only mounts such as /kaggle/input.
+        env = lmdb.open(path, subdir=False, readonly=True, lock=False, readahead=LMDB_READAHEAD, meminit=False,
+                        max_readers=2048)
+        _LMDB_ENVS[path] = env
+    return env
+
+
+def _close_lmdb_envs():
+    if _LMDB_PID == os.getpid():
+        for env in _LMDB_ENVS.values():
+            env.close()
+    _LMDB_ENVS.clear()
+
+
+atexit.register(_close_lmdb_envs)
+
 
 class MyDataset(object):
     def __init__(self, modality, data_partition, data_dir, label_fp, annonation_direc=None,
-        preprocessing_func=None, data_suffix='.npz', use_boundary=False):
+        preprocessing_func=None, data_suffix='.npz', use_boundary=False, data_format='raw'):
+        assert data_format in ('raw', 'lmdb'), f"Unknown data format: {data_format}"
+        self._data_format = data_format
         assert os.path.isfile( label_fp ), \
             f"File path provided for the labels does not exist. Path iput: {label_fp}."
         self._data_partition = data_partition
@@ -27,7 +70,11 @@ class MyDataset(object):
 
         self.preprocessing_func = preprocessing_func
 
-        if self.use_boundary or (self.is_var_length and data_partition == "train"):
+        # -- lmdb backend: the word durations are stored inside the LMDB index, no annotation folder needed
+        self._lmdb_path = None
+        self._durations = {}
+
+        if data_format == 'raw' and (self.use_boundary or (self.is_var_length and data_partition == "train")):
             assert self._annonation_direc is not None, \
                 "Directory path provided for the sequence timestamp (--annonation-direc) should not be empty."
             assert os.path.isdir(self._annonation_direc), \
@@ -44,7 +91,10 @@ class MyDataset(object):
 
 
         # -- add examples to self._data_files
-        self._get_files_for_partition()
+        if self._data_format == 'lmdb':
+            self._get_files_from_lmdb()
+        else:
+            self._get_files_for_partition()
 
 
         # -- from self._data_files to self.list
@@ -83,8 +133,54 @@ class MyDataset(object):
         # If we are not using the full set of labels, remove examples for labels not used
         self._data_files = [ f for f in self._data_files if f.split('/')[self.label_idx] in self._labels ]
 
+    def _get_files_from_lmdb(self):
+        """Read the sample index of <data_dir>/<partition>.lmdb (written by preprocessing/lrw_lmdb.py).
+
+        Each sample becomes the pseudo path WORD/<partition>/STEM.npz, so the label, instance id and
+        filtering logic of the raw backend apply unchanged.
+        """
+        self._lmdb_path = os.path.join(self._data_dir, f'{self._data_partition}.lmdb')
+        assert os.path.isfile(self._lmdb_path), f"LMDB file does not exist. Path input: {self._lmdb_path}"
+        with _get_lmdb_env(self._lmdb_path).begin() as txn:
+            fmt = txn.get(b'__format__')
+            index = json.loads(txn.get(b'__index__'))
+            lmdb_labels = json.loads(txn.get(b'__labels__'))
+        assert fmt == LMDB_FORMAT, f"Unsupported LMDB format {fmt!r} in {self._lmdb_path}, expected {LMDB_FORMAT!r}"
+
+        for key, label_id, duration in index:
+            word, stem = key.split('/')
+            # class ids are always recomputed from --label-path (below); check the stored ones agree
+            assert lmdb_labels[label_id] == word, f"Inconsistent label id for {key} in {self._lmdb_path}"
+            pseudo_path = f'{word}/{self._data_partition}/{stem}.npz'
+            self._data_files.append(pseudo_path)
+            self._durations[pseudo_path] = float(duration)
+
+        # If we are not using the full set of labels, remove examples for labels not used
+        self._data_files = [ f for f in self._data_files if f.split('/')[self.label_idx] in self._labels ]
+
+    def _load_data_lmdb(self, filename):
+        word, _, stem = filename.split('/')
+        key = f'v:{word}/{os.path.splitext(stem)[0]}'.encode('utf-8')
+        with _get_lmdb_env(self._lmdb_path).begin() as txn:
+            payload = txn.get(key)
+        if payload is None:
+            raise KeyError(f"Key {key!r} missing from {self._lmdb_path}")
+        with np.load(io.BytesIO(payload)) as npz:
+            return npz['data']
+
+    def _get_duration(self, filename):
+        """Word duration in seconds: line 5 of the LRW .txt annotation, or the value stored in the LMDB index."""
+        if self._data_format == 'lmdb':
+            return self._durations[filename]
+        info_txt = os.path.join(self._annonation_direc, *filename.split('/')[self.label_idx:] )  # swap base folder
+        info_txt = os.path.splitext( info_txt )[0] + '.txt'   # swap extension
+        info = read_txt_lines(info_txt)
+        return float( info[4].split(' ')[1] )
+
     def load_data(self, filename):
 
+        if self._data_format == 'lmdb':
+            return self._load_data_lmdb(filename)
         try:
             if filename.endswith('npz'):
                 return np.load(filename)['data']
@@ -97,12 +193,8 @@ class MyDataset(object):
             sys.exit()
 
     def _apply_variable_length_aug(self, filename, raw_data):
-        # read info txt file (to see duration of word, to be used to do temporal cropping)
-        info_txt = os.path.join(self._annonation_direc, *filename.split('/')[self.label_idx:] )  # swap base folder
-        info_txt = os.path.splitext( info_txt )[0] + '.txt'   # swap extension
-        info = read_txt_lines(info_txt)  
-
-        utterance_duration = float( info[4].split(' ')[1] )
+        # duration of word, to be used to do temporal cropping
+        utterance_duration = self._get_duration(filename)
         half_interval = int( utterance_duration/2.0 * self.fps)  # num frames of utterance / 2
                 
         n_frames = raw_data.shape[0]
@@ -114,12 +206,8 @@ class MyDataset(object):
 
 
     def _get_boundary(self, filename, raw_data):
-        # read info txt file (to see duration of word, to be used to do temporal cropping)
-        info_txt = os.path.join(self._annonation_direc, *filename.split('/')[self.label_idx:] )  # swap base folder
-        info_txt = os.path.splitext( info_txt )[0] + '.txt'   # swap extension
-        info = read_txt_lines(info_txt)
-
-        utterance_duration = float( info[4].split(' ')[1] )
+        # duration of word, to be used to do temporal cropping
+        utterance_duration = self._get_duration(filename)
         # boundary is used for the features at the top of ResNet, which as a frame rate of 25fps.
         if self.fps == 25:
             half_interval = int( utterance_duration/2.0 * self.fps)

@@ -110,6 +110,58 @@ You can pass the checkpoint path (`.pth` or `.pth.tar`) *`<CHECKPOINT-PATH>`* to
 
 LRS3 pretrain word alignments are turned into LRW-style 1.16 s word clips, with a 500-word vocabulary, so the same `main.py` trains the visual model on them. The mouth ROI extraction, vocabulary, clip building and feature extraction are documented in [preprocessing/lrs3](./preprocessing/lrs3), and the config is [configs/lrs3_resnet18_mstcn.json](./configs/lrs3_resnet18_mstcn.json).
 
+5. Train from LMDB files instead of folders of `.npz`/`.txt` (for example on Kaggle).
+
+Thousands of small files are slow on network or overlay file systems such as `/kaggle/input`. [preprocessing/lrw_lmdb.py](./preprocessing/lrw_lmdb.py) packs the mouth ROIs and the word durations of each partition into one file. The loader then reads that file with `--data-format lmdb`. The samples, class ids, preprocessing and augmentations are the same as with the folders: only the storage changes, and the model, optimizer and training loop are untouched.
+
+Requirements: `pip install lmdb` (only for this backend).
+
+Pack once, where the `.npz` mouth ROIs and the LRW `.txt` annotations are:
+
+```Shell
+python preprocessing/lrw_lmdb.py --mouths-dir <MOUTH-ROIS-DIRECTORY> \
+                                 --annotations-dir <ANNONATION-DIRECTORY> \
+                                 --labels-file labels/500WordsSortedList.txt \
+                                 --output-dir <LMDB-DIRECTORY>
+```
+
+This writes `<LMDB-DIRECTORY>/train.lmdb`, `val.lmdb` and `test.lmdb`. Each file holds the original `.npz` bytes under `v:<WORD>/<CLIP>`, plus a `__index__` record with `[key, label_id, duration]` for every clip, `__labels__` and `__format__` (`lrw-npz-v1`). The `.txt` files themselves are not stored, only the `Duration:` value that the loader uses. The packer expects LRW's `Duration: <x> seconds` line.
+
+Train by pointing `--data-dir` at that folder. `--annonation-direc` is not needed:
+
+```Shell
+# Kaggle: the dataset is mounted read-only, which works because the files are opened with lock=False
+python main.py --modality video \
+               --config-path configs/lrw_resnet18_mstcn.json \
+               --data-format lmdb \
+               --data-dir /kaggle/input/<YOUR-LMDB-DATASET> \
+               --label-path labels/500WordsSortedList.txt \
+               --workers 4
+```
+
+To go back to the folders, drop `--data-format lmdb` (the default is `raw`) and pass the original `--data-dir` and `--annonation-direc`.
+
+Class ids always come from `--label-path`, as with the folders. The ids stored in the LMDB are only checked for consistency. Each process, and so each DataLoader worker, opens its own read-only handle the first time it reads a sample, and reuses it for later samples. Forked workers drop the handle they inherit from the parent.
+
+Check that the LMDB gives the same samples as the folders: the same clip set, labels, durations, decoded arrays, seeded augmented tensors, boundaries and collated batches. It exits with 1 and lists the differences if any. `--num-samples 0` compares every clip, and `--check-all-records` reads every record:
+
+```Shell
+python tools/check_lmdb_equivalence.py --raw-data-dir <MOUTH-ROIS-DIRECTORY> \
+                                       --annonation-direc <ANNONATION-DIRECTORY> \
+                                       --lmdb-dir <LMDB-DIRECTORY> \
+                                       --label-path labels/500WordsSortedList.txt \
+                                       --num-samples 0 --check-all-records
+```
+
+Benchmark the two backends, CPU only, with the same clips, order, preprocessing and seed. It reports time to first batch, batch latency, batches/s and samples/s for each worker count, on a cold page cache (`--drop-cache`) and a warm one. Either backend can be left out, for example `--lmdb-dir` alone on Kaggle:
+
+```Shell
+python tools/benchmark_dataloader.py --raw-data-dir <MOUTH-ROIS-DIRECTORY> \
+                                     --annonation-direc <ANNONATION-DIRECTORY> \
+                                     --lmdb-dir <LMDB-DIRECTORY> \
+                                     --workers 0 2 4 8 --drop-cache
+```
+
 
 ### How to test
 

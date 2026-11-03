@@ -53,6 +53,7 @@ def get_data_loaders(args):
                 preprocessing_func=preprocessing[partition],
                 data_suffix='.npz',
                 use_boundary=args.use_boundary,
+                data_format=getattr(args, 'data_format', 'raw'),
                 ) for partition in partitions}
     dset_loaders = {x: torch.utils.data.DataLoader(
                         dsets[x],

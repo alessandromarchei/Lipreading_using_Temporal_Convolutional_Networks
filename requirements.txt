@@ -6,3 +6,4 @@ matplotlib >= 3.0.3
 tqdm >= 4.35.0
 scikit-image >= 0.13.0
 librosa >= 0.7.0
+lmdb >= 1.0.0  # optional, only for --data-format lmdb
